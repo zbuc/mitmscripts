@@ -32,10 +32,7 @@ def piglify_response(context, flow):
                 html_response = True
 
         if not html_response:
-            print "Not piglifying response without text/html Content-Type header"
             return
-
-        print "Piglifying Response"
 
         soup = BeautifulSoup(flow.response.content, 'html.parser')
         replace = []
@@ -58,21 +55,19 @@ def disable_cache(context, flow):
 def puglify_image(context, flow):
     with decoded(flow.response):
         try:
-            print flow.response.headers.get_first('content-type', '')
             if flow.response.headers.get_first("content-type", "").startswith("image") or flow.response.content.startswith("\xFF\xD8\xFF\xE0\x00\x10\x4A\x46\x49\x46\x00"):
                 img = cStringIO.StringIO(open(os.path.normcase(os.path.dirname(inspect.stack()[0][1]) + '/pug.jpg'), 'rb').read())
                 flow.response.content = img.getvalue()
                 flow.response.headers["content-type"] = ["image/jpeg"]
-                print "puglified"
-                print flow.response.headers
-                print len(flow.response.content)
         except Exception, e:
+            print "Error puglifying:"
             print repr(e)
 
 
 def colorify(context, flow):
     with decoded(flow.response):
         try:
+            color = context.plugins.get_option_value('colorswitcher', 'color')
             css_response = False
             for header in flow.response.headers:
                 if header[0].lower() == 'content-type' and ('css' in header[1].lower() or 'html' in header[1].lower()):
@@ -84,12 +79,11 @@ def colorify(context, flow):
             if not css_response:
                 return
 
-            print "pinkifying css file"
-            print context.plugins
             import re
             pattern_hex = re.compile('#[0-9]+', re.IGNORECASE)
-            flow.response.content = pattern_hex.sub("#EA5C7A", flow.response.content)
+            flow.response.content = pattern_hex.sub(color, flow.response.content)
         except Exception, e:
+            print "Error colorifying:"
             print repr(e)
 
 
@@ -140,7 +134,7 @@ def start(context, argv):
                                         ])
 
         context.plugins.register_action('piglify',
-                                        title='Pig Latin Plugin',
+                                        title='P[iu]g Latin Plugin',
                                         actions=[
                                                  {
                                                   'title': 'Piglify Response',
