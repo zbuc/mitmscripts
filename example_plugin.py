@@ -88,7 +88,14 @@ def colorify(context, flow):
 
 
 def start(context, argv):
-    def hexdump(src, length=8):
+    def hexdump(flow, **kwargs):
+        target = kwargs.get('target')
+        src = ''
+        if target == 'request':
+            src = flow.request.content
+        elif target == 'response':
+            src = flow.response.content
+        length = kwargs.get('length') or 8
         result = []
         digits = 4 if isinstance(src, unicode) else 2
         for i in xrange(0, len(src), length):
