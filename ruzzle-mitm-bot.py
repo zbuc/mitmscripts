@@ -1,5 +1,6 @@
 import re
 import json
+import os
 from functools import wraps
 from threading import Event
 
@@ -9,11 +10,6 @@ from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
 from cryptography.hazmat.primitives import padding
 from cryptography.hazmat.backends import default_backend
 
-from flask import Flask
-from flask import render_template
-from flask import request as frequest
-
-app = Flask("ruzzle-mitm-bot")
 
 MY_USER_ID = '4650359378'
 scoring = {
@@ -45,55 +41,6 @@ scoring = {
     'Z': 10
 }
 AES_SECRET = "398C7E2774E7A196AF30DFED78762328427E1F1EAD4C1F5D0D86CE44948E1CB0"
-
-
-# NOTE: this still will return an HTTP response to someone who finds it
-# you should use a firewall in addition if you wish to avoid giving an
-# indication of an HTTP service
-def private(fxn):
-    @wraps(fxn)
-    def __inner(*args, **kwargs):
-        if frequest.environ.get('HTTP_X_REAL_IP', frequest.remote_addr) != '127.0.0.1':
-            return render_template('404.html'), 400
-
-        return fxn(*args, **kwargs)
-
-    return __inner
-
-
-@app.route('/games')
-@private
-def games():
-    return render_template('index.html', state=repr(app.mitm_context.state.get('games')))
-
-
-@app.route('/events.json')
-@private
-def events():
-    with open('/Users/chrisczub/.mitmproxy/weblog', 'a+') as log:
-        try:
-            if not frequest.args.get('noBlock'):
-                app.event.wait(30)
-
-            if app.event.isSet():
-                app.event.clear()
-
-            return json.dumps({'requests': app.mitm_context.state.get('requests'),
-                               'responses': app.mitm_context.state.get('responses'),
-                               'cheat_enabled': app.mitm_context.state.get('cheat_enabled')})
-        except Exception, e:
-            log.write(repr(e))
-
-
-@app.route('/')
-@private
-def index():
-    with open('/Users/chrisczub/.mitmproxy/weblog', 'a+') as log:
-        try:
-            return render_template('index.html', requests=app.mitm_context.state.get('requests'),
-                                   responses=app.mitm_context.state.get('responses'))
-        except Exception, e:
-            log.write(repr(e))
 
 
 def get_word_indexes(board, word):
@@ -200,7 +147,7 @@ def letterize(board, decoded_moves):
 
 
 def decrypt(iv, cryptotext):
-    with open('/Users/chrisczub/.mitmproxy/log', 'a+') as log:
+    with open(os.path.expanduser("~/.mitmproxy/log"), 'a+') as log:
         log.write('decrypting cryptotext...\n')
         backend = default_backend()
         key = AES_SECRET.decode("hex")
@@ -231,7 +178,7 @@ def encrypt(iv, plaintext):
 
 
 def start_servers(context):
-    with open('/Users/chrisczub/.mitmproxy/weblog', 'a+') as log:
+    with open(os.path.expanduser("~/.mitmproxy/weblog"), 'a+') as log:
         try:
             log.write("starting servers\n")
             # flask app
@@ -239,26 +186,6 @@ def start_servers(context):
             app.mitm_context = context
         except Exception, e:
             log.write(repr(e))
-
-
-def start(context, argv):
-    with open('/Users/chrisczub/.mitmproxy/log', 'a+') as log:
-        log.write("start")
-        if len(argv) != 2:
-            raise ValueError('Usage: -s "ruzzle-mitm-bot.py dirname"')
-        context.dirname = argv[1]
-        context.seen = {}
-        context.state = {'games': {}, 'requests': [], 'responses': [], 'cheat_enabled': True}
-
-        # store a reference to the context on it
-        app.mitm_context = context
-        context.app_registry.add(app, "ruzzle", 80)
-
-        # create event for synchronization
-        app.event = Event()
-        context.event = app.event
-        # first call should just return empty, subsequent will block
-        app.event.set()
 
 
 def get_filenames(context, flow, type):
@@ -288,8 +215,27 @@ def get_desired_request(mode):
     return desired_request
 
 
+def decrypt_flow(flow, **kwargs):
+    target = kwargs.get('target')
+    print "target is %s" % target
+
+    iv = flow.request.headers.get('payload-session')[0].decode('hex')
+    cryptotext = getattr(flow, target).content
+    decrypted = decrypt(iv, cryptotext)
+
+    return decrypted
+
+
+def decrypt_request(flow):
+    return decrypt_flow(flow, 'request')
+
+
+def decrypt_response(flow):
+    return decrypt_flow(flow, 'response')
+
+
 def request(context, flow):
-    with open("/Users/chrisczub/.mitmproxy/log", "a+") as log:
+    with open("~/.mitmproxy/log", "a+") as log:
         if not 'davincigames' in flow.request.host:
             return
 
@@ -299,10 +245,8 @@ def request(context, flow):
         desired_request = get_desired_request(context.state.get('mode'))
 
         try:
-            cryptofile, plainfile = get_filenames(context, flow, "request")
-            iv = flow.request.headers.get('payload-session')[0].decode('hex')
-            cryptotext = flow.request.content
-            decrypted = decrypt(iv, cryptotext)
+            #cryptofile, plainfile = get_filenames(context, flow, "request")
+            decrypted = decrypt_request(flow)
             context.state['requests'].append({'body': decrypted,
                                               'url': "%s%s" % (flow.request.host, flow.request.path),
                                               'method': flow.request.method})
@@ -375,7 +319,7 @@ def request(context, flow):
 
 
 def response(context, flow):
-    with open("/Users/chrisczub/.mitmproxy/log", "a+") as log:
+    with open("~/.mitmproxy/log", "a+") as log:
         if 'davincigames' not in flow.request.host:
             return
 
@@ -383,12 +327,10 @@ def response(context, flow):
         try:
             log.write('response coming in...\n')
             with decoded(flow.response):  # automatically decode gzipped responses.
-                cryptofile, plainfile = get_filenames(context, flow, "response")
-                iv = flow.request.headers.get('payload-session')[0].decode('hex')
-                cryptotext = flow.response.content
+                #cryptofile, plainfile = get_filenames(context, flow, "response")
 
                 log.write('decrypting response...\n')
-                decrypted = decrypt(iv, cryptotext)
+                decrypted = decrypt_response(flow)
                 context.state['responses'].append({'body': decrypted,
                                                    'url': "%s%s" % (flow.request.host, flow.request.path),
                                                    'method': flow.request.method})
@@ -418,3 +360,12 @@ def response(context, flow):
         except Exception, e:
             log.write("EXCEPTION DECRYPTING RESPONSE!\n")
             log.write(repr(e))
+
+
+def start(context, argv):
+    context.seen = {}
+    context.state = {'games': {}, 'requests': [], 'responses': [], 'cheat_enabled': True}
+
+    context.plugins.register_view('decrypt',
+                              title='Ruzzle Decrypt View Plugin',
+                              transformer=decrypt_flow)
