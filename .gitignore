@@ -1,0 +1,12 @@
+.DS_Store
+MANIFEST
+/build
+/dist
+/tmp
+/doc
+/venv
+*.py[cdo]
+*.swp
+*.swo
+.coverage
+.idea
