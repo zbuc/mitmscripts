@@ -147,20 +147,17 @@ def letterize(board, decoded_moves):
 
 
 def decrypt(iv, cryptotext):
-    with open(os.path.expanduser("~/.mitmproxy/log"), 'a+') as log:
-        log.write('decrypting cryptotext...\n')
-        backend = default_backend()
-        key = AES_SECRET.decode("hex")
-        cipher = Cipher(algorithms.AES(key), modes.CBC(iv), backend=backend)
-        decryptor = cipher.decryptor()
-        plaintext = decryptor.update(cryptotext)
-        plaintext = plaintext + decryptor.finalize()
-        unpadder = padding.PKCS7(algorithms.AES.block_size).unpadder()
-        unpadded = unpadder.update(plaintext)
-        unpadded += unpadder.finalize()
-        log.write('decoding plaintext...\n')
-        unpadded = unpadded.decode('utf-8')
-        return unpadded
+    backend = default_backend()
+    key = AES_SECRET.decode("hex")
+    cipher = Cipher(algorithms.AES(key), modes.CBC(iv), backend=backend)
+    decryptor = cipher.decryptor()
+    plaintext = decryptor.update(cryptotext)
+    plaintext = plaintext + decryptor.finalize()
+    unpadder = padding.PKCS7(algorithms.AES.block_size).unpadder()
+    unpadded = unpadder.update(plaintext)
+    unpadded += unpadder.finalize()
+    unpadded = unpadded.decode('utf-8')
+    return unpadded
 
 
 def encrypt(iv, plaintext):
@@ -175,17 +172,6 @@ def encrypt(iv, plaintext):
     cryptotext = decryptor.update(padded_data)
     cryptotext = cryptotext + decryptor.finalize()
     return cryptotext
-
-
-def start_servers(context):
-    with open(os.path.expanduser("~/.mitmproxy/weblog"), 'a+') as log:
-        try:
-            log.write("starting servers\n")
-            # flask app
-            # store a reference to the context on it
-            app.mitm_context = context
-        except Exception, e:
-            log.write(repr(e))
 
 
 def get_filenames(context, flow, type):
@@ -206,18 +192,8 @@ def get_filenames(context, flow, type):
     return (cryptofile, plainfile)
 
 
-def get_desired_request(mode):
-    desired_request = ''
-    if mode == 'waiting_for_game':
-        desired_request = 'createGame'
-    elif mode == 'waiting_to_intercept':
-        desired_request = 'playRound'
-    return desired_request
-
-
 def decrypt_flow(flow, **kwargs):
     target = kwargs.get('target')
-    print "target is %s" % target
 
     iv = flow.request.headers.get('payload-session')[0].decode('hex')
     cryptotext = getattr(flow, target).content
@@ -227,145 +203,181 @@ def decrypt_flow(flow, **kwargs):
 
 
 def decrypt_request(flow):
-    return decrypt_flow(flow, 'request')
+    return decrypt_flow(flow, target='request')
 
 
 def decrypt_response(flow):
-    return decrypt_flow(flow, 'response')
+    return decrypt_flow(flow, target='response')
 
 
-def request(context, flow):
-    with open("~/.mitmproxy/log", "a+") as log:
-        if not 'davincigames' in flow.request.host:
-            return
+def cheat_game(context, flow):
+    if 'davincigames' not in flow.request.host:
+        return
 
-        if not context.state.get('mode') in ('waiting_for_game', 'waiting_to_intercept'):
-            context.state['mode'] = 'waiting_for_game'
+    desired_request = 'playRound'
 
-        desired_request = get_desired_request(context.state.get('mode'))
+    try:
+        game_state = json.loads(context.plugins.get_option_value('ruzzle', 'game_state'))
+    except ValueError:
+        game_state = {}
 
+    try:
+        decrypted = decrypt_request(flow)
+        request_json = json.loads(decrypted)
+
+        if desired_request in flow.request.get_path_components():
+            if game_state.get(unicode(request_json[u'round']['gameId'])):
+                print "cheating at known game... " + unicode(request_json[u'round']['gameId'])
+                this_game = game_state.get(unicode(request_json[u'round']['gameId']))
+                target_player = str(this_game['target_player'])
+
+                # find all the words possible
+                all_words = request_json.get(
+                    u'round')['board']['words']
+                # now we need to play a winning game
+                wordcount, all_word_movestring = get_movestring(
+                    request_json.get(u'round')['board']['board'], all_words)
+
+                # play all the words
+                request_json[u'round'][
+                    'player' + target_player + 'Moves'] = all_word_movestring
+                request_json[u'round']['wordsInRound'] = wordcount
+
+                # now change the swipe distance to something believable
+                request_json[u'round'][
+                    'player' + target_player + 'SwipeDistance'] = int(len(all_word_movestring) / 0.09733124018838304)
+                request_json[u'round']['swipeDistance'] = int(
+                    len(all_word_movestring) / 0.09733124018838304)
+
+                # now make a string of move times...
+                # should probably randomize these so the bot isn't as
+                # fingerprintable :)
+                lastmovetime = 106600
+                firstmovetime = 8866
+                increment = (lastmovetime - firstmovetime) / wordcount
+                count = 1
+                moveTimes = str(firstmovetime)
+                prevmovetime = firstmovetime
+                while count < wordcount:
+                    moveTimes += "," + str(prevmovetime + increment)
+                    prevmovetime = prevmovetime + increment
+                    count += 1
+                request_json[u'round'][
+                    'player' + target_player + 'MoveTimes'] = moveTimes
+
+                # now update our score
+                request_json[u'round']['player' + target_player + 'Score'] = sum([score_word(request_json.get(
+                    u'round')['board']['board'], request_json.get(u'round')['board']['bonus'], word) for word in all_words])
+
+                # no errors!
+                request_json[u'round']['moveErrors'] = 0
+                request_json[u'round'][
+                    'Player' + target_player + 'MoveErrors'] = 0
+
+                # re-encrypt and put back on the wire
+                iv = flow.request.headers.get('payload-session')[0].decode('hex')
+                flow.request.content = encrypt(
+                    iv, json.dumps(request_json))
+
+    except Exception, e:
+        print "Error cheating"
+        print repr(e)
+
+
+def extract_game(context, flow):
+    try:
         try:
-            #cryptofile, plainfile = get_filenames(context, flow, "request")
-            decrypted = decrypt_request(flow)
-            context.state['requests'].append({'body': decrypted,
-                                              'url': "%s%s" % (flow.request.host, flow.request.path),
-                                              'method': flow.request.method})
-            context.request_json = json.loads(decrypted)
+            game_state = json.loads(context.plugins.get_option_value('ruzzle', 'game_state'))
+        except ValueError:
+            game_state = {}
+
+        with decoded(flow.request):
+            if 'davincigames' not in flow.request.host:
+                return
 
             if 'readGame' in flow.request.get_path_components():
-                # we can extract the user ID for a game from this request object
+                # we can extract the user ID for a game from this request
+                # object
+                request_json = json.loads(decrypt_request(flow))
                 try:
-                    if context.request_json[u'game'].get('player1User').get('userId') == int(MY_USER_ID):
-                        context.state['games'][unicode(context.request_json[u'game']['id'])] = 1
-                    else:
-                        context.state['games'][unicode(context.request_json[u'game']['id'])] = 2
-                except Exception, e:
-                    log.write("EXCEPTION, setting player 2...")
-                    log.write(repr(e))
-                    context.state['games'][unicode(context.request_json[u'game']['id'])] = 2
-
-            if context.cheat_enabled and desired_request in flow.request.get_path_components():
-                if desired_request == 'playRound' and \
-                        context.state['games'].get(unicode(context.request_json[u'round']['gameId'])):
-                    player_id = str(context.state['games'].get(unicode(context.request_json[u'round']['gameId'])))
-                    # find all the words possible
-                    all_words = context.request_json.get(u'round')['board']['words']
-                    context.state['mode'] = 'waiting_for_game'
-                    # now we need to play a winning game
-                    wordcount, all_word_movestring = get_movestring(context.request_json.get(u'round')['board']['board'], all_words)
-                    log.write("Hacked word choices from\n")
-                    log.write(repr(letterize(context.request_json.get(u'round')['board']['board'], decode_moves(context.request_json[u'round']['player' + player_id + 'Moves']))))
-                    log.write("\n")
-                    # play all the words
-                    context.request_json[u'round']['player' + player_id + 'Moves'] = all_word_movestring
-                    context.request_json[u'round']['wordsInRound'] = wordcount
-
-                    # now change the swipe distance to something believable
-                    context.request_json[u'round']['player' + player_id + 'SwipeDistance'] = int(len(all_word_movestring) / 0.09733124018838304)
-                    context.request_json[u'round']['swipeDistance'] = int(len(all_word_movestring) / 0.09733124018838304)
-
-                    # now make a string of move times...
-                    # should probably randomize these so the bot isn't as fingerprintable :)
-                    lastmovetime = 106600
-                    firstmovetime = 8866
-                    increment = (lastmovetime - firstmovetime) / wordcount
-                    count = 1
-                    moveTimes = str(firstmovetime)
-                    prevmovetime = firstmovetime
-                    while count < wordcount:
-                        moveTimes += "," + str(prevmovetime + increment)
-                        prevmovetime = prevmovetime + increment
-                        count += 1
-                    context.request_json[u'round']['player' + player_id + 'MoveTimes'] = moveTimes
-
-                    # now update our score
-                    context.request_json[u'round']['player' + player_id + 'Score'] = sum([score_word(context.request_json.get(u'round')['board']['board'], context.request_json.get(u'round')['board']['bonus'], word) for word in all_words])
-
-                    # no errors!
-                    context.request_json[u'round']['moveErrors'] = 0
-                    context.request_json[u'round']['Player' + player_id + 'MoveErrors'] = 0
-                    context.state['requests'].pop()
-                    context.state['requests'].append({'body': json.dumps(context.request_json),
-                                                      'url': "%s%s" % (flow.request.host, flow.request.path),
-                                                      'method': flow.request.method})
-                    flow.request.content = encrypt(iv, json.dumps(context.request_json))
-
-            # tell the other threads we have new data
-            context.event.set()
-
-        except Exception, e:
-            log.write("EXCEPTION DECRYPTING REQUEST!\n")
-            log.write(repr(e))
-
-
-def response(context, flow):
-    with open("~/.mitmproxy/log", "a+") as log:
-        if 'davincigames' not in flow.request.host:
-            return
-
-        desired_request = get_desired_request(context.state.get('mode'))
-        try:
-            log.write('response coming in...\n')
-            with decoded(flow.response):  # automatically decode gzipped responses.
-                #cryptofile, plainfile = get_filenames(context, flow, "response")
-
-                log.write('decrypting response...\n')
-                decrypted = decrypt_response(flow)
-                context.state['responses'].append({'body': decrypted,
-                                                   'url': "%s%s" % (flow.request.host, flow.request.path),
-                                                   'method': flow.request.method})
-                log.write('loading json...\n')
-                context.response_json = json.loads(decrypted)
-                log.write('decrypted...\n')
-
-            if desired_request in flow.request.get_path_components():
-                if desired_request == 'createGame':
-                    context.state['mode'] = 'waiting_to_intercept'
-                    # now we need to pull the user's ID from the game
-                    # we could also do more things like verify the game ID
-                    # against the one used in playRound, otherwise we might
-                    # make some invalid requests
-                    log.write('gonna f with it...\n')
-                    try:
-                        if context.response_json.get('player1User').get('userId') == MY_USER_ID:
-                            context.state['games'][unicode(context.response_json.get('id'))] = 1
+                    game = game_state.get(unicode(request_json[u'game']['id'])) or {}
+                    if request_json.get(u'game').get('player1User'):
+                        # the first readGame request doesn't have all the game state
+                        # but the response will
+                        if int(request_json[u'game'].get('player1User').get('userId')) == int(MY_USER_ID):
+                            game['target_player'] = 1
                         else:
-                            context.state['games'][unicode(context.response_json.get('id'))] = 2
-                    except Exception, e:
-                        log.write("EXCEPTION, setting player 2...")
-                        log.write(repr(e))
-                        context.state['games'][unicode(context.response_json.get('id'))] = 2
-            # tell the other threads we have new data
-            context.event.set()
-        except Exception, e:
-            log.write("EXCEPTION DECRYPTING RESPONSE!\n")
-            log.write(repr(e))
+                            game['target_player'] = 2
+
+                        game['description'] = "Player 1: %s vs 2: %s" % (request_json[u'game'].get('player1User').get('userId'), request_json[u'game'].get('player2User').get('userId'))
+                        game_state[unicode(request_json[u'game']['id'])] = game
+
+                except Exception, e:
+                    print("EXCEPTION")
+                    print(repr(e))
+
+            if flow.response:
+                with decoded(flow.response):
+                    # response available on this flow...
+                    response_json = json.loads(decrypt_response(flow))
+                    if response_json.get('game'):
+                        # there's a game element present
+                        server_game = response_json['game']
+                        game = game_state.get(unicode(server_game['id'])) or {}
+                        game['round'] = server_game.get('round')
+                        game_state[unicode(server_game['id'])] = game
+
+                    if response_json.get('player1User'):
+                        # readGame response
+                        if 'readGame' in flow.request.get_path_components():
+                            if int(response_json.get('player1User').get('userId')) == int(MY_USER_ID):
+                                game['target_player'] = 1
+                            else:
+                                game['target_player'] = 2
+
+                            game['description'] = "Player 1: %s vs 2: %s" % (response_json.get('player1User').get('userId'), response_json.get('player2User').get('userId'))
+                            game_state[unicode(response_json['id'])] = game
+
+            context.plugins.set_option_value('ruzzle', 'game_state', json.dumps(game_state))
+    except Exception, e:
+        print "Error extracting game: %s" % repr(e)
 
 
 def start(context, argv):
-    context.seen = {}
-    context.state = {'games': {}, 'requests': [], 'responses': [], 'cheat_enabled': True}
+    context.plugins.register_view('Decrypt',
+                                  title='Ruzzle Decrypt View Plugin',
+                                  transformer=decrypt_flow)
 
-    context.plugins.register_view('decrypt',
-                              title='Ruzzle Decrypt View Plugin',
-                              transformer=decrypt_flow)
+    context.plugins.register_action('ruzzle',
+                                    title='Ruzzle Cheats',
+                                    actions=[
+                                        {
+                                          'title': 'Extract Game Info',
+                                          'id': 'extract_game',
+                                          'possible_hooks': [
+                                                'request',
+                                                'response', ],
+                                          'state': {
+                                              'every_flow': True,
+                                          },
+                                        },
+                                        {
+                                          'title': 'Cheat at Game',
+                                          'id': 'cheat_game',
+                                          'possible_hooks': [
+                                                'request',
+                                          ],
+                                          'state': {
+                                              'every_flow': False,
+                                          },
+                                        },
+                                    ],
+                                    options=[{
+                                        'title': 'Game State',
+                                        'id': 'game_state',
+                                        'state': {
+                                            'value': 'No Games Detected',
+                                        },
+                                        'type': 'display_only',
+                                    }],
+                                    )
